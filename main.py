@@ -6,7 +6,7 @@ import logging
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 
-# Configuração do logging para debug
+# Configuração do logging para debug com nível detalhado
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
 
 app = FastAPI()
@@ -38,24 +38,38 @@ async def fetch_campaign_insights(campaign_id: str, access_token: str, session: 
         "date_preset": "maximum",
         "access_token": access_token
     }
+    
+    logging.debug(f"Iniciando fetch dos insights para campanha {campaign_id} com URL: {campaign_insights_url} e params: {params_campaign_insights}")
     req_start = time.perf_counter()
     async with session.get(campaign_insights_url, params=params_campaign_insights) as resp:
         req_end = time.perf_counter()
         response_time = req_end - req_start
-        logging.debug(f"HTTP REQUEST: GET {campaign_insights_url} completado em {response_time:.3f} segundos com status {resp.status}")
-        if resp.status != 200:
+        logging.debug(f"Requisição insights: {campaign_insights_url} completada em {response_time:.3f} segundos com status {resp.status}")
+        try:
             response_text = await resp.text()
+            logging.debug(f"Resposta texto para insights da campanha {campaign_id}: {response_text}")
+        except Exception as e:
+            logging.error(f"Erro ao ler resposta de insights da campanha {campaign_id}: {e}")
+            response_text = ""
+            
+        if resp.status != 200:
             logging.error(f"Erro ao buscar insights para campanha {campaign_id}: {resp.status} - {response_text}")
             raise Exception(f"Erro {resp.status}: {response_text}")
-        return await resp.json()
+        try:
+            response_json = await resp.json()
+            logging.debug(f"JSON dos insights para campanha {campaign_id}: {response_json}")
+        except Exception as e:
+            logging.error(f"Erro ao decodificar JSON dos insights para campanha {campaign_id}: {e}")
+            raise
+        return response_json
 
 async def fetch_paused_campaigns(account_id: str, access_token: str):
     """
     Consulta todas as campanhas com status 'PAUSED' para uma determinada conta do Meta Ads.
     """
+    logging.debug(f"Iniciando consulta de campanhas pausadas para account_id: {account_id}")
     timeout = aiohttp.ClientTimeout(total=3)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        # URL e parâmetros para buscar campanhas pausadas
         campaigns_url = f"https://graph.facebook.com/v16.0/act_{account_id}/campaigns"
         filtering = json.dumps([{
             "field": "effective_status",
@@ -68,27 +82,42 @@ async def fetch_paused_campaigns(account_id: str, access_token: str):
             "access_token": access_token
         }
         
+        logging.debug(f"Buscando campanhas pausadas com URL: {campaigns_url} e params: {params_campaigns}")
         req_start = time.perf_counter()
         async with session.get(campaigns_url, params=params_campaigns) as resp:
             req_end = time.perf_counter()
             response_time = req_end - req_start
-            logging.debug(f"HTTP REQUEST: GET {campaigns_url} completado em {response_time:.3f} segundos com status {resp.status}")
-            if resp.status != 200:
+            logging.debug(f"Requisição campanhas pausadas completada em {response_time:.3f} segundos com status {resp.status}")
+            try:
                 response_text = await resp.text()
+                logging.debug(f"Resposta texto para campanhas pausadas: {response_text}")
+            except Exception as e:
+                logging.error(f"Erro ao ler resposta de campanhas pausadas: {e}")
+                response_text = ""
+                
+            if resp.status != 200:
                 logging.error(f"Erro ao buscar campanhas pausadas: {resp.status} - {response_text}")
                 raise Exception(f"Erro {resp.status}: {response_text}")
-            campaigns_data = await resp.json()
-        
+            try:
+                campaigns_data = await resp.json()
+                logging.debug(f"JSON recebido das campanhas pausadas: {campaigns_data}")
+            except Exception as e:
+                logging.error(f"Erro ao decodificar JSON de campanhas pausadas: {e}")
+                raise
+
         campaigns_list = campaigns_data.get("data", [])
+        logging.debug(f"Número de campanhas pausadas encontradas: {len(campaigns_list)}")
         paused_campaigns = []
         tasks = []
         
-        # Cria tarefas para buscar os insights de cada campanha pausada
         for camp in campaigns_list:
+            logging.debug(f"Agendando fetch dos insights para campanha: {camp}")
             tasks.append(fetch_campaign_insights(camp["id"], access_token, session))
         
+        logging.debug("Iniciando gather dos insights para cada campanha pausada")
         insights_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
+        logging.debug("Resultados dos insights obtidos")
+
         for idx, camp in enumerate(campaigns_list):
             campaign_obj = {
                 "id": camp.get("id", ""),
@@ -125,8 +154,12 @@ async def fetch_paused_campaigns(account_id: str, access_token: str):
                     campaign_obj["clicks"] = int(clicks)
                     campaign_obj["ctr"] = format_percentage(ctr_value)
                     campaign_obj["cpc"] = format_currency(cpc)
+                    logging.debug(f"Dados processados para campanha {camp.get('id', '')}: {campaign_obj}")
+                else:
+                    logging.debug(f"Sem dados de insights para a campanha {camp.get('id', '')}.")
             paused_campaigns.append(campaign_obj)
         
+        logging.debug(f"Total de campanhas pausadas processadas: {len(paused_campaigns)}")
         return paused_campaigns
 
 @app.post("/paused_campaigns")
@@ -135,11 +168,15 @@ async def get_paused_campaigns(payload: dict = Body(...)):
     Endpoint para buscar campanhas pausadas do Meta Ads.
     O body da requisição deve conter 'account_id' e 'access_token'.
     """
+    logging.debug("Requisição recebida em /paused_campaigns")
     account_id = payload.get("account_id")
     access_token = payload.get("access_token")
+    
     if not account_id or not access_token:
         logging.error("Payload inválido: 'account_id' ou 'access_token' ausentes.")
         raise HTTPException(status_code=400, detail="É necessário fornecer 'account_id' e 'access_token' no corpo da requisição.")
+    
+    logging.debug(f"Payload recebido: account_id={account_id}, access_token={access_token}")
     
     try:
         paused_campaigns = await fetch_paused_campaigns(account_id, access_token)
@@ -148,7 +185,7 @@ async def get_paused_campaigns(payload: dict = Body(...)):
             "paused_campaigns_total": total_paused,
             "paused_campaigns": paused_campaigns
         }
-        logging.info(f"Campanhas pausadas retornadas: {result}")
+        logging.info(f"Resposta final do endpoint: {result}")
         return result
     except Exception as e:
         logging.error(f"Erro no endpoint /paused_campaigns: {e}", exc_info=True)
@@ -156,4 +193,5 @@ async def get_paused_campaigns(payload: dict = Body(...)):
 
 if __name__ == "__main__":
     import uvicorn
+    logging.info("Iniciando aplicação com uvicorn na porta 8000")
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
